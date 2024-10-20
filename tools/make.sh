@@ -188,6 +188,15 @@ create_env () {
     echo -e "${BIGreen}>>>${RST} Installing dependencies ..."
   fi
 
+  current_dir=$(pwd)
+  pushd "$repo_root/shim"
+  "$poetry_home_root/bin/poetry" install --no-root $poetry_verbosity || { echo -e "${BIRed}!!!${RST} Poetry environment installation failed"; return 1; }
+    if [ $? -ne 0 ] ; then
+    echo -e "${BIRed}!!!${RST} Virtual environment creation for shim failed."
+    return 1
+  fi
+
+  popd
   "$poetry_home_root/bin/poetry" install --no-root $poetry_verbosity || { echo -e "${BIRed}!!!${RST} Poetry environment installation failed"; return 1; }
   if [ $? -ne 0 ] ; then
     echo -e "${BIRed}!!!${RST} Virtual environment creation failed."
@@ -219,9 +228,38 @@ install_runtime_dependencies () {
   pushd "$repo_root" > /dev/null || return > /dev/null
 
   echo -e "${BIGreen}>>>${RST} Installing runtime dependencies ..."
-  "$poetry_home_root/bin/poetry" run python "$repo_root/tools/runtime_dependencies.py"
+  "$poetry_home_root/bin/poetry" run python "$repo_root/tools/runtime_dependencies.py" "$@"
 }
 
+fix_macos_build () {
+  macoscontents="$1"
+  macosdir="$macoscontents/MacOS"
+  ayonexe="$macosdir/ayon"
+  ayonmacosexe="$macosdir/ayon_macos"
+  tmp_ayonexe="$macosdir/ayon_tmp"
+  # force hide icon from Dock
+  defaults write "$macoscontents/Info" LSUIElement 1
+
+  # Fix codesign bug by creating copy of executable, removing source
+  #   executable and replacing by the copy
+  #   - this will clear cache of codesign
+  cp "$ayonexe" "$tmp_ayonexe"
+  rm "$ayonexe"
+  mv "$tmp_ayonexe" "$ayonexe"
+
+  if [ -f "$ayonmacosexe" ]; then
+    cp "$ayonmacosexe" "$tmp_ayonexe"
+    rm "$ayonmacosexe"
+    mv "$tmp_ayonexe" "$ayonmacosexe"
+  fi
+
+  # fix code signing issue
+  echo -e "${BIGreen}>>>${RST} Fixing code signatures ...\c"
+  codesign --remove-signature "$ayonexe" || { echo -e "${BIRed}FAILED${RST}"; return 1; }
+  if [ -f "$ayonmacosexe" ]; then
+    codesign --remove-signature "$ayonmacosexe" || { echo -e "${BIRed}FAILED${RST}"; return 1; }
+  fi
+}
 # Main
 build_ayon () {
   should_make_installer=$1
@@ -234,6 +272,7 @@ build_ayon () {
 
   echo -e "${BIYellow}---${RST} Cleaning build directory ..."
   rm -rf "$repo_root/build" && mkdir "$repo_root/build" > /dev/null
+  rm -rf "$repo_root/shim/dist" > /dev/null
 
   echo -e "${BIGreen}>>>${RST} Building AYON ${BIWhite}[${RST} ${BIGreen}$ayon_version${RST} ${BIWhite}]${RST}"
   echo -e "${BIGreen}>>>${RST} Cleaning cache files ..."
@@ -257,31 +296,22 @@ build_ayon () {
   echo -e "${BIGreen}>>>${RST} Building ..."
   "$poetry_home_root/bin/poetry" run python -m pip --no-color freeze > "$repo_root/build/requirements.txt"
   "$poetry_home_root/bin/poetry" run python "$repo_root/tools/_venv_deps.py"
-  if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    "$poetry_home_root/bin/poetry" run python "$repo_root/setup.py" build &> "$repo_root/build/build.log" || { echo -e "${BIRed}------------------------------------------${RST}"; cat "$repo_root/build/build.log"; echo -e "${BIRed}------------------------------------------${RST}"; echo -e "${BIRed}!!!${RST} Build failed, see the build log."; return 1; }
-  elif [[ "$OSTYPE" == "darwin"* ]]; then
-    "$poetry_home_root/bin/poetry" run python "$repo_root/setup.py" bdist_mac &> "$repo_root/build/build.log" || { echo -e "${BIRed}------------------------------------------${RST}"; cat "$repo_root/build/build.log"; echo -e "${BIRed}------------------------------------------${RST}"; echo -e "${BIRed}!!!${RST} Build failed, see the build log."; return 1; }
-  fi
-  "$poetry_home_root/bin/poetry" run python "$repo_root/tools/build_post_process.py" "build" || { echo -e "${BIRed}!!!>${RST} ${BIYellow}Failed to process dependencies${RST}"; return 1; }
 
+  build_command="build"
   if [[ "$OSTYPE" == "darwin"* ]]; then
-    macoscontents="$repo_root/build/AYON $ayon_version.app/Contents"
-    macosdir="$macoscontents/MacOS"
-    ayonexe="$macosdir/ayon"
-    tmp_ayonexe="$macosdir/ayon_tmp"
-    # force hide icon from Dock
-    defaults write "$macoscontents/Info" LSUIElement 1
+    build_command="bdist_mac"
+  fi
 
-    # Fix codesign bug by creating copy of executable, removing source
-    #   executable and replacing by the copy
-    #   - this will clear cache of codesign
-    cp "$ayonexe" "$tmp_ayonexe"
-    rm "$ayonexe"
-    mv "$tmp_ayonexe" "$ayonexe"
-
-    # fix code signing issue
-    echo -e "${BIGreen}>>>${RST} Fixing code signatures ...\c"
-    codesign --remove-signature "$ayonexe" || { echo -e "${BIRed}FAILED${RST}"; return 1; }
+  pushd "$repo_root/shim"
+  "$poetry_home_root/bin/poetry" run python "$repo_root/shim/setup.py" $build_command &> "$repo_root/shim/build.log" || { echo -e "${BIRed}------------------------------------------${RST}"; cat "$repo_root/shim/build.log"; echo -e "${BIRed}------------------------------------------${RST}"; echo -e "${BIRed}!!!${RST} Build failed, see the build log."; return 1; }
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    fix_macos_build "$repo_root/shim/build/AYON.app/Contents"
+  fi
+  popd
+  "$poetry_home_root/bin/poetry" run python "$repo_root/setup.py" $build_command &> "$repo_root/build/build.log" || { echo -e "${BIRed}------------------------------------------${RST}"; cat "$repo_root/build/build.log"; echo -e "${BIRed}------------------------------------------${RST}"; echo -e "${BIRed}!!!${RST} Build failed, see the build log."; return 1; }
+  "$poetry_home_root/bin/poetry" run python "$repo_root/tools/build_post_process.py" "build" || { echo -e "${BIRed}!!!>${RST} ${BIYellow}Failed to process dependencies${RST}"; return 1; }
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    fix_macos_build "$repo_root/build/AYON $ayon_version.app/Contents"
   fi
 
   if [[ "$should_make_installer" == 1 ]]; then
@@ -396,6 +426,7 @@ default_help() {
   echo "Runtime targets:"
   echo "  create-env                    Install Poetry and update venv by lock file"
   echo "  install-runtime-dependencies  Install runtime dependencies (Qt binding)"
+  echo "      --use-pyside2                 Install PySide2 instead of PySide6."
   echo "  install-runtime               Alias for 'install-runtime-dependencies'"
   echo "  build                         Build desktop application"
   echo "  make-installer                Make desktop application installer"
@@ -403,7 +434,8 @@ default_help() {
   echo "  upload                        Upload installer to server"
   echo "  create-server-package         Create package ready for AYON server"
   echo "  run                           Run desktop application from code"
-  echo "  docker-build [variant]        Build AYON using Docker. Variant can be 'centos7', 'debian', 'rocky8' or 'rocky9'"
+  echo "  docker-build [variant]        Build AYON using Docker. Variant can be 'debian', 'rocky8' or 'rocky9'"
+  echo "      --use-pyside2                 Use PySide2 instead of PySide6."
   echo ""
 }
 
@@ -423,7 +455,7 @@ main() {
       exit $return_code
       ;;
     "installruntimedependencies"|"installruntime")
-      install_runtime_dependencies || return_code=$?
+      install_runtime_dependencies "${@:2}" || return_code=$?
       exit $return_code
       ;;
     "build"|"buildayon")
